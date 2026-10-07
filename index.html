@@ -274,7 +274,7 @@ const STORAGE_KEY = 'junior-bank-db-v1';
    Leave blank to preview locally — but nothing will be saved or
    shared with students until this is filled in.
    ============================================================ */
-const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbwoMvZMxdSswUVI6xKBHObdb7PI6hDSZKW5lKJHiFMH4IiefXeeKgRkOeRB6KAKfciS/exec';
+const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbyQOA0iboIoaj6nkrVNn1U5ip-aKO2Iig29BYnEIdIgFxkHyD9xrydQWPpGcfOeolZs/exec';
 
 const defaultDb = () => ({
   teacherPin: '1234',
@@ -290,6 +290,7 @@ let db = null;
 let session = { role: null, studentId: null }; // role: 'teacher' | 'student'
 let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null };
 let backendMode = 'none'; // 'appsscript' | 'claude-storage' | 'none'
+let backendLoadError = '';
 let backendLoadFailed = false; // true if the initial fetch from the backend failed — blocks saving to prevent overwriting real data with a blank session
 
 function uid(prefix){ return prefix + '_' + Math.random().toString(36).slice(2,9); }
@@ -365,7 +366,7 @@ function resizeImageFile(file, maxDim){
 async function refreshDb(){
   if (backendMode !== 'appsscript' || !BACKEND_URL) return; // nothing shared to refresh from
   try{
-    const res = await fetch(BACKEND_URL + '?action=get');
+    const res = await fetch(BACKEND_URL);
     const json = await res.json();
     if (json && json.value){
       const parsed = JSON.parse(json.value);
@@ -385,8 +386,12 @@ async function loadDb(){
   //    anyone with the link, no Claude or Google login required.
   if (BACKEND_URL){
     try{
-      const res = await fetch(BACKEND_URL + '?action=get');
-      const json = await res.json();
+      const res = await fetch(BACKEND_URL);
+      if (!res.ok) throw new Error('The backend answered with HTTP status ' + res.status);
+      const rawText = await res.text();
+      let json = null;
+      try { json = JSON.parse(rawText); }
+      catch(jsonErr){ throw new Error('The backend returned a web page instead of data (starts with: ' + rawText.slice(0,80).replace(/\s+/g,' ') + ')'); }
       let parsed = null;
       if (json && json.value){
         try { parsed = JSON.parse(json.value); } catch(parseErr){ parsed = null; }
@@ -411,6 +416,7 @@ async function loadDb(){
       db = defaultDb();
       backendMode = 'appsscript';
       backendLoadFailed = true;
+      backendLoadError = (e && e.message) ? e.message : String(e);
       showToast('Could not reach the backend — your saved data is safe, but not loaded this time. Check your connection and reload.');
       return;
     }
@@ -483,6 +489,7 @@ function render(){
           <div class="login-mark" style="background:var(--rust);">!</div>
           <div class="login-title">Couldn't connect</div>
           <div class="login-sub">We couldn't reach your saved classroom data. Nothing has been changed or lost — reload to try again.</div>
+          <div class="small-note" style="margin:0 0 14px 0;word-break:break-word;">Technical detail: ${escapeHtml(backendLoadError || 'unknown')}</div>
           <button class="btn gold" id="retryConnectBtn" style="width:100%;justify-content:center;">Try again</button>
         </div>
       </div>`;
