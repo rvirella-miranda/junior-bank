@@ -261,20 +261,23 @@
 <script>
 /* =========================================================
    JUNIOR BANK — classroom economy app
-   Data is saved through a small Google Apps Script "backend" so it
-   works with no Claude account, on any device with a browser — see
-   BACKEND_URL below and the setup guide provided alongside this file.
+   Data is saved in a Firebase Realtime Database, so it works for any
+   student on any device with a browser — no Claude or Google account
+   needed. See FIREBASE_DB_URL below and the Firebase setup guide.
    ========================================================= */
 
-const STORAGE_KEY = 'junior-bank-db-v1';
+const STORAGE_KEY = 'junior-bank-db-v1'; // only used for previews inside Claude
 
 /* ============================================================
-   PASTE YOUR GOOGLE APPS SCRIPT WEB APP URL BELOW
-   (see "Junior Bank – Backend Setup Guide" for how to get this).
-   Leave blank to preview locally — but nothing will be saved or
+   PASTE YOUR FIREBASE REALTIME DATABASE URL BELOW
+   (see "Junior Bank - Firebase Setup Guide" for how to find it).
+   It looks like: https://your-project-default-rtdb.firebaseio.com
+   Leave blank to preview locally — nothing will be saved or
    shared with students until this is filled in.
    ============================================================ */
-const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbyQOA0iboIoaj6nkrVNn1U5ip-aKO2Iig29BYnEIdIgFxkHyD9xrydQWPpGcfOeolZs/exec';
+const FIREBASE_DB_URL = 'https://junior-bank-547c3-default-rtdb.firebaseio.com';
+const FIREBASE_ROOT = 'juniorBank'; // the folder inside your database this app uses
+const COLLECTIONS = ['students','households','bills','charges','storeItems','transactions'];
 
 const defaultDb = () => ({
   teacherPin: '1234',
@@ -289,7 +292,8 @@ const defaultDb = () => ({
 let db = null;
 let session = { role: null, studentId: null }; // role: 'teacher' | 'student'
 let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null };
-let backendMode = 'none'; // 'appsscript' | 'claude-storage' | 'none'
+let backendMode = 'none'; // 'firebase' | 'claude-storage' | 'none'
+let lastSynced = null; // copy of what the server held the last time we synced (used to work out exactly what changed)
 let backendLoadError = '';
 let backendLoadFailed = false; // true if the initial fetch from the backend failed — blocks saving to prevent overwriting real data with a blank session
 
@@ -354,70 +358,131 @@ function resizeImageFile(file, maxDim){
   });
 }
 
+/* ------------------------------------------------------------------
+   FIREBASE STORAGE LAYER
+   Each student, charge, transaction, etc. is its own small record in the
+   database. When something changes we send ONLY the records that changed
+   (and balance changes are sent as "add/subtract this amount", not "set
+   the balance to X"), so two people acting at the same time can never
+   erase each other's work.
+   ------------------------------------------------------------------ */
+function fbUrl(extra){
+  return FIREBASE_DB_URL.replace(/\/+$/,'') + '/' + FIREBASE_ROOT + '.json' + (extra || '');
+}
+async function fbRead(){
+  const res = await fetch(fbUrl());
+  const text = await res.text();
+  if (!res.ok) throw new Error('Firebase answered HTTP ' + res.status + ' — ' + text.slice(0,120));
+  try { return JSON.parse(text); }
+  catch(e){ throw new Error('Firebase returned something unexpected (starts with: ' + text.slice(0,80).replace(/\s+/g,' ') + ')'); }
+}
+async function fbPatch(ops){
+  const res = await fetch(fbUrl('?print=silent'), { method:'PATCH', body: JSON.stringify(ops) });
+  if (!res.ok){
+    let t = ''; try { t = await res.text(); } catch(e){}
+    throw new Error('Firebase answered HTTP ' + res.status + ' — ' + t.slice(0,120));
+  }
+}
+function toRecords(x){
+  if (!x) return [];
+  if (Array.isArray(x)) return x.filter(v=>v && typeof v === 'object');
+  return Object.entries(x).filter(([k,v])=>v && typeof v === 'object').map(([k,v])=>({ ...v, id: v.id || k }));
+}
+function toPlainList(x){
+  if (!x) return [];
+  return Array.isArray(x) ? x.filter(v=>v!==null && v!==undefined) : Object.values(x);
+}
+// Firebase drops empty values (null, empty lists), so every record is rebuilt
+// with sensible defaults when it's read back.
+const normalizers = {
+  students:     r => ({ id:r.id, name:r.name, pin:String(r.pin ?? ''), jobTitle:r.jobTitle ?? '', payAmount:r.payAmount ?? 0, payFreq:r.payFreq ?? 'weekly', householdId:r.householdId ?? null, checking:r.checking ?? 0, savings:r.savings ?? 0 }),
+  households:   r => ({ id:r.id, name:r.name ?? '' }),
+  bills:        r => { const o = { id:r.id, name:r.name ?? '', amount:r.amount ?? 0, targetType:r.targetType }; if (r.targetId !== undefined) o.targetId = r.targetId; if (r.targetIds !== undefined) o.targetIds = toPlainList(r.targetIds); return o; },
+  charges:      r => ({ id:r.id, billId:r.billId ?? null, billName:r.billName ?? '', studentId:r.studentId, amount:r.amount ?? 0, paid:!!r.paid, createdAt:r.createdAt ?? 0, paidAt:r.paidAt ?? null }),
+  storeItems:   r => ({ id:r.id, name:r.name ?? '', price:r.price ?? 0, stock:(r.stock === undefined ? null : r.stock), image:r.image ?? null }),
+  transactions: r => ({ id:r.id, ts:r.ts ?? 0, studentId:r.studentId, type:r.type, amount:r.amount ?? 0, desc:r.desc ?? '', account:r.account || 'checking' })
+};
+function snapshotToDb(raw){
+  raw = raw || {};
+  const out = defaultDb();
+  out.teacherPin = (raw.meta && raw.meta.teacherPin) ? String(raw.meta.teacherPin) : '1234';
+  COLLECTIONS.forEach(c=>{
+    out[c] = toRecords(raw[c]).filter(r => r.id && (c !== 'students' || r.name)).map(normalizers[c]);
+  });
+  const byName = (a,b)=>String(a.name).localeCompare(String(b.name));
+  out.students.sort(byName); out.households.sort(byName); out.bills.sort(byName); out.storeItems.sort(byName);
+  out.charges.sort((a,b)=>a.createdAt-b.createdAt);
+  out.transactions.sort((a,b)=>a.ts-b.ts);
+  return out;
+}
+function buildPatch(current, baseline){
+  const ops = {};
+  if (current.teacherPin !== baseline.teacherPin) ops['meta/teacherPin'] = current.teacherPin;
+  COLLECTIONS.forEach(c=>{
+    const curMap = {}, baseMap = {};
+    current[c].forEach(r=>{ curMap[r.id] = r; });
+    baseline[c].forEach(r=>{ baseMap[r.id] = r; });
+    Object.keys(curMap).forEach(id=>{
+      const cr = curMap[id], br = baseMap[id];
+      if (!br){ ops[c + '/' + id] = JSON.parse(JSON.stringify(cr)); return; }
+      const keys = new Set([...Object.keys(cr), ...Object.keys(br)]);
+      keys.forEach(k=>{
+        if (k === 'id') return;
+        const cv = cr[k], bv = br[k];
+        if (JSON.stringify(cv) === JSON.stringify(bv)) return;
+        const isCounter = (c === 'students' && (k === 'checking' || k === 'savings')) || (c === 'storeItems' && k === 'stock');
+        if (isCounter && typeof cv === 'number' && typeof bv === 'number'){
+          ops[c + '/' + id + '/' + k] = { '.sv': { increment: cv - bv } };
+        } else {
+          ops[c + '/' + id + '/' + k] = (cv === undefined) ? null : cv;
+        }
+      });
+    });
+    Object.keys(baseMap).forEach(id=>{ if (!curMap[id]) ops[c + '/' + id] = null; });
+  });
+  return ops;
+}
+async function pullFromServer(){
+  const fresh = snapshotToDb(await fbRead());
+  db = fresh;
+  lastSynced = JSON.parse(JSON.stringify(fresh));
+}
+
 /**
- * Pulls the absolute latest saved data from the backend and replaces the
- * local `db` with it. Every action that changes a balance calls this FIRST,
- * right before reading/mutating anything — so it's always working from a
- * snapshot that's at most a fraction of a second old, instead of possibly
- * many minutes old (e.g. a Chromebook tab someone left open). This is what
- * prevents one student's save from silently erasing another's change that
- * happened moments earlier on a different device.
+ * Pulls the absolute latest saved data and replaces the local `db` with it.
+ * Every action that changes something calls this FIRST, so it always works
+ * from a snapshot that's at most a fraction of a second old.
  */
 async function refreshDb(){
-  if (backendMode !== 'appsscript' || !BACKEND_URL) return; // nothing shared to refresh from
+  if (backendMode !== 'firebase') return; // nothing shared to refresh from
   try{
-    const res = await fetch(BACKEND_URL);
-    const json = await res.json();
-    if (json && json.value){
-      const parsed = JSON.parse(json.value);
-      if (parsed && Array.isArray(parsed.students) && Array.isArray(parsed.transactions)){
-        db = parsed;
-      }
-    }
+    await pullFromServer();
   }catch(e){
     console.error('refresh before save failed', e);
-    // Keep working with whatever local db we have; saveDb() below will
-    // still attempt to persist it rather than silently losing the action.
+    // Keep working with whatever we have; because changes are sent as
+    // "what changed since the last sync", this is still safe.
   }
 }
 
 async function loadDb(){
-  // 1) Preferred: a configured Google Apps Script backend — works for
-  //    anyone with the link, no Claude or Google login required.
-  if (BACKEND_URL){
+  // 1) Preferred: a configured Firebase database — works for anyone with
+  //    the link, no Claude or Google login required.
+  if (FIREBASE_DB_URL){
     try{
-      const res = await fetch(BACKEND_URL);
-      if (!res.ok) throw new Error('The backend answered with HTTP status ' + res.status);
-      const rawText = await res.text();
-      let json = null;
-      try { json = JSON.parse(rawText); }
-      catch(jsonErr){ throw new Error('The backend returned a web page instead of data (starts with: ' + rawText.slice(0,80).replace(/\s+/g,' ') + ')'); }
-      let parsed = null;
-      if (json && json.value){
-        try { parsed = JSON.parse(json.value); } catch(parseErr){ parsed = null; }
-      }
-      // Only treat this as "nothing saved yet" if the data doesn't even
-      // look like a real database — never overwrite real data just because
-      // a field happened to be empty or a request hiccupped.
-      const looksLikeRealDb = parsed && Array.isArray(parsed.students) && Array.isArray(parsed.transactions);
-      backendMode = 'appsscript';
-      if (looksLikeRealDb){
-        db = parsed;
-      } else {
-        db = defaultDb();
-        await saveDb(); // safe: only runs on a genuinely first-ever load
-      }
+      await pullFromServer();
+      backendMode = 'firebase';
       return;
     }catch(e){
-      // Network/backend error: do NOT overwrite anything remotely. Show a
-      // blank local session so nothing looks silently fine, but the real
-      // data on the server is left completely untouched.
+      // Connection/permission problem: do NOT save anything. Show a blank
+      // local session so nothing looks silently fine, but the real data on
+      // the server is left completely untouched.
       console.error('backend load failed', e);
       db = defaultDb();
-      backendMode = 'appsscript';
+      lastSynced = JSON.parse(JSON.stringify(db));
+      backendMode = 'firebase';
       backendLoadFailed = true;
       backendLoadError = (e && e.message) ? e.message : String(e);
-      showToast('Could not reach the backend — your saved data is safe, but not loaded this time. Check your connection and reload.');
+      showToast('Could not reach the database — your saved data is safe, but not loaded this time. Check your connection and reload.');
       return;
     }
   }
@@ -432,7 +497,7 @@ async function loadDb(){
     backendMode = 'claude-storage';
     return;
   }
-  // 3) No backend configured at all — in-memory only for this tab
+  // 3) No database configured at all — in-memory only for this tab
   db = defaultDb();
   backendMode = 'none';
 }
@@ -442,13 +507,13 @@ async function saveDb(){
     return false;
   }
   try{
-    if (backendMode === 'appsscript' && BACKEND_URL){
-      // Sent as text/plain on purpose (no custom headers) so the browser
-      // treats this as a "simple request" and Apps Script accepts it directly.
-      const res = await fetch(BACKEND_URL, { method:'POST', body: JSON.stringify({ value: JSON.stringify(db) }) });
-      if (!res.ok) throw new Error('Backend responded with HTTP ' + res.status);
-      const json = await res.json().catch(()=>null);
-      if (!json || json.ok !== true) throw new Error('Backend did not confirm the save');
+    if (backendMode === 'firebase'){
+      const ops = buildPatch(db, lastSynced);
+      if (Object.keys(ops).length === 0) return true;
+      await fbPatch(ops);
+      // Re-read so we're holding exactly what the server now has.
+      try { await pullFromServer(); }
+      catch(e){ lastSynced = JSON.parse(JSON.stringify(db)); }
       return true;
     } else if (backendMode === 'claude-storage' && typeof window.storage !== 'undefined'){
       await window.storage.set(STORAGE_KEY, JSON.stringify(db), true);
@@ -518,9 +583,9 @@ function renderLogin(){
   const isTeacher = uiState.loginRole === 'teacher';
   const studentOptions = db.students.slice().sort((a,b)=>a.name.localeCompare(b.name))
     .map(s=>`<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
-  const setupBanner = backendMode !== 'appsscript' ? `
+  const setupBanner = backendMode !== 'firebase' ? `
     <div style="max-width:420px;margin:0 auto 14px auto;background:#fdf3e2;border:1px solid var(--gold);border-radius:14px;padding:12px 16px;font-size:12.5px;color:var(--ink);">
-      ⚠️ <b>Setup needed:</b> ${backendMode==='claude-storage' ? "You're in preview mode — students won't see this data yet." : "Nothing is being saved yet."} Add your Google Apps Script URL to the file — see the setup guide.
+      ⚠️ <b>Setup needed:</b> ${backendMode==='claude-storage' ? "You're in preview mode — students won't see this data yet." : "Nothing is being saved yet."} Add your Firebase database URL to the file — see the setup guide.
     </div>` : '';
   return `
   <div class="topbar">
@@ -1368,9 +1433,9 @@ function bindLedger(){
 /* ---- Settings tab ---- */
 function renderTeacherSettings(){
   const statusInfo = {
-    'appsscript': { label: 'Connected — Google Apps Script backend', color: 'var(--teal)', note: 'Data is shared with every student device automatically.' },
-    'claude-storage': { label: 'Preview mode only (Claude storage)', color: 'var(--gold)', note: "This works while you're testing here, but students without a Claude account won't see this data. Set BACKEND_URL in the file before handing it out — see the setup guide." },
-    'none': { label: 'Not connected — nothing is being saved', color: 'var(--rust)', note: 'Set BACKEND_URL near the top of the file to a Google Apps Script Web App URL. See the setup guide for step-by-step instructions.' }
+    'firebase': { label: 'Connected — Firebase database', color: 'var(--teal)', note: 'Data is shared with every student device automatically.' },
+    'claude-storage': { label: 'Preview mode only (Claude storage)', color: 'var(--gold)', note: "This works while you're testing here, but students without a Claude account won't see this data. Set FIREBASE_DB_URL in the file before handing it out — see the setup guide." },
+    'none': { label: 'Not connected — nothing is being saved', color: 'var(--rust)', note: 'Set FIREBASE_DB_URL near the top of the file to your Firebase Realtime Database URL. See the setup guide for step-by-step instructions.' }
   };
   const status = statusInfo[backendMode] || statusInfo['none'];
   return `
