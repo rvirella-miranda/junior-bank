@@ -196,6 +196,13 @@
   .store-item .iname{ font-weight:600; margin-bottom:4px; }
   .store-item .iprice{ font-family:'IBM Plex Mono'; color:var(--teal); font-weight:600; font-size:16px; margin-bottom:8px;}
   .store-item .istock{ font-size:11.5px; color:#A99A85; margin-bottom:10px; }
+  .cat-tabs{ display:flex; flex-wrap:wrap; gap:8px; margin:2px 0 18px 0; }
+  .cat-tab{ border:1.5px solid var(--line); background:var(--paper); color:#6b6250; font-weight:700; font-size:13px; padding:7px 14px; border-radius:20px; }
+  .cat-tab:hover{ background:var(--paper-2); }
+  .cat-tab.active{ background:var(--teal); border-color:var(--teal); color:#fff; }
+  .cat-tab .cat-count{ opacity:.75; font-weight:600; margin-left:3px; }
+  .store-section-title{ font-family:'Quicksand'; font-weight:700; font-size:16px; color:var(--teal); margin:20px 0 10px 0; padding-bottom:6px; border-bottom:2px solid var(--line); }
+  .store-section-title:first-child{ margin-top:4px; }
 
   .toast{
     position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
@@ -277,7 +284,7 @@ const STORAGE_KEY = 'junior-bank-db-v1'; // only used for previews inside Claude
    ============================================================ */
 const FIREBASE_DB_URL = 'https://junior-bank-547c3-default-rtdb.firebaseio.com';
 const FIREBASE_ROOT = 'juniorBank'; // the folder inside your database this app uses
-const COLLECTIONS = ['students','households','bills','charges','storeItems','transactions'];
+const COLLECTIONS = ['students','households','bills','charges','storeCategories','storeItems','transactions'];
 
 const defaultDb = () => ({
   teacherPin: '1234',
@@ -285,18 +292,24 @@ const defaultDb = () => ({
   households: [],     // {id,name}
   bills: [],           // {id,name,amount,freq,targetType,targetId} freq: 'one-time'|'weekly'|'biweekly'|'monthly'
   charges: [],         // {id,billId,billName,studentId,amount,paid,createdAt,paidAt}
-  storeItems: [],      // {id,name,price,stock} stock:null = unlimited
+  storeCategories: [], // {id,name} — sections of the class store (Food, Trips, ...)
+  storeItems: [],      // {id,name,price,stock,categoryId,image} stock:null = unlimited
   transactions: []     // {id,ts,studentId,type,amount,desc}
 });
 
 let db = null;
 let session = { role: null, studentId: null }; // role: 'teacher' | 'student'
-let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null };
+let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'' };
 let backendMode = 'none'; // 'firebase' | 'claude-storage' | 'none'
 let lastSynced = null; // copy of what the server held the last time we synced (used to work out exactly what changed)
 let backendLoadError = '';
 let backendLoadFailed = false; // true if the initial fetch from the backend failed — blocks saving to prevent overwriting real data with a blank session
 
+function ensureShape(d){
+  const base = defaultDb();
+  Object.keys(base).forEach(k=>{ if (d[k] === undefined || d[k] === null) d[k] = base[k]; });
+  return d;
+}
 function uid(prefix){ return prefix + '_' + Math.random().toString(36).slice(2,9); }
 function money(cents){
   const neg = cents < 0;
@@ -399,7 +412,8 @@ const normalizers = {
   households:   r => ({ id:r.id, name:r.name ?? '' }),
   bills:        r => { const o = { id:r.id, name:r.name ?? '', amount:r.amount ?? 0, targetType:r.targetType }; if (r.targetId !== undefined) o.targetId = r.targetId; if (r.targetIds !== undefined) o.targetIds = toPlainList(r.targetIds); return o; },
   charges:      r => ({ id:r.id, billId:r.billId ?? null, billName:r.billName ?? '', studentId:r.studentId, amount:r.amount ?? 0, paid:!!r.paid, createdAt:r.createdAt ?? 0, paidAt:r.paidAt ?? null }),
-  storeItems:   r => ({ id:r.id, name:r.name ?? '', price:r.price ?? 0, stock:(r.stock === undefined ? null : r.stock), image:r.image ?? null }),
+  storeCategories: r => ({ id:r.id, name:r.name ?? '' }),
+  storeItems:   r => ({ id:r.id, name:r.name ?? '', price:r.price ?? 0, stock:(r.stock === undefined ? null : r.stock), categoryId:r.categoryId ?? null, image:r.image ?? null }),
   transactions: r => ({ id:r.id, ts:r.ts ?? 0, studentId:r.studentId, type:r.type, amount:r.amount ?? 0, desc:r.desc ?? '', account:r.account || 'checking' })
 };
 function snapshotToDb(raw){
@@ -410,7 +424,7 @@ function snapshotToDb(raw){
     out[c] = toRecords(raw[c]).filter(r => r.id && (c !== 'students' || r.name)).map(normalizers[c]);
   });
   const byName = (a,b)=>String(a.name).localeCompare(String(b.name));
-  out.students.sort(byName); out.households.sort(byName); out.bills.sort(byName); out.storeItems.sort(byName);
+  out.students.sort(byName); out.households.sort(byName); out.bills.sort(byName); out.storeItems.sort(byName); out.storeCategories.sort(byName);
   out.charges.sort((a,b)=>a.createdAt-b.createdAt);
   out.transactions.sort((a,b)=>a.ts-b.ts);
   return out;
@@ -490,7 +504,7 @@ async function loadDb(){
   if (typeof window.storage !== 'undefined'){
     try{
       const res = await window.storage.get(STORAGE_KEY, true);
-      db = JSON.parse(res.value);
+      db = ensureShape(JSON.parse(res.value));
     }catch(e){
       db = defaultDb();
     }
@@ -1220,12 +1234,37 @@ function bindBills(){
 }
 
 /* ---- Store tab ---- */
+function categoryName(id){
+  const c = db.storeCategories.find(x=>x.id===id);
+  return c ? c.name : '';
+}
+function categoryOptions(selectedId){
+  return `<option value="">— none —</option>` + db.storeCategories.map(c=>`<option value="${c.id}" ${c.id===selectedId?'selected':''}>${escapeHtml(c.name)}</option>`).join('');
+}
 function renderTeacherStore(){
+  const catRows = db.storeCategories.map(c=>{
+    const n = db.storeItems.filter(it=>it.categoryId===c.id).length;
+    if (uiState.editingCategoryId === c.id){
+      return `<tr>
+        <td><input type="text" id="editCategoryName" value="${escapeHtml(c.name)}" style="margin-bottom:0;"></td>
+        <td>${n}</td>
+        <td><button class="btn sm gold" data-save-category="${c.id}">Save</button>
+            <button class="btn sm ghost" data-cancel-category="1">Cancel</button></td>
+      </tr>`;
+    }
+    return `<tr>
+      <td>${escapeHtml(c.name)}</td>
+      <td>${n}</td>
+      <td><button class="btn sm ghost" data-edit-category="${c.id}">Rename</button>
+          <button class="icon-btn" data-del-category="${c.id}">✕</button></td>
+    </tr>`;
+  }).join('');
   const rows = db.storeItems.map(it=>{
     if (uiState.editingStoreItemId === it.id){
       return `<tr>
         <td>${it.image ? `<img class="table-thumb" src="${it.image}">` : `<div class="table-thumb-placeholder"></div>`}</td>
         <td><input type="text" id="editItemName" value="${escapeHtml(it.name)}" style="margin-bottom:0;"></td>
+        <td><select id="editItemCategory" style="margin-bottom:0;">${categoryOptions(it.categoryId)}</select></td>
         <td><input type="number" step="0.01" id="editItemPrice" value="${(it.price/100).toFixed(2)}" style="margin-bottom:0;"></td>
         <td><input type="number" id="editItemStock" value="${it.stock===null?'':it.stock}" placeholder="blank=unlimited" style="margin-bottom:0;"></td>
         <td>
@@ -1237,6 +1276,7 @@ function renderTeacherStore(){
     return `<tr>
       <td>${it.image ? `<img class="table-thumb" src="${it.image}">` : `<div class="table-thumb-placeholder"></div>`}</td>
       <td>${escapeHtml(it.name)}</td>
+      <td>${escapeHtml(categoryName(it.categoryId) || '—')}</td>
       <td class="mono">${money(it.price)}</td>
       <td>${it.stock===null?'Unlimited':it.stock}</td>
       <td>
@@ -1249,12 +1289,24 @@ function renderTeacherStore(){
   }).join('');
   return `
   <div class="card">
+    <h3>Store sections (${db.storeCategories.length})</h3>
+    <div class="small-note">Create sections like Food, Entertainment, or Trips. Students see them as tabs in the store, and can also search.</div>
+    <div class="row-inline">
+      <div><label>New section name</label><input type="text" id="newCategoryName" placeholder="e.g. Food"></div>
+      <button class="btn gold" id="addCategoryBtn" style="margin-bottom:12px;">+ Add section</button>
+    </div>
+    ${db.storeCategories.length===0 ? '' : `
+    <table><thead><tr><th>Section</th><th>Items</th><th></th></tr></thead><tbody>${catRows}</tbody></table>`}
+  </div>
+  <div class="card">
     <h3>Add a store item</h3>
     <div class="grid3">
       <div><label>Item name</label><input type="text" id="newItemName" placeholder="e.g. Homework pass"></div>
       <div><label>Price ($)</label><input type="number" step="0.01" id="newItemPrice" placeholder="3.00"></div>
       <div><label>Stock (blank = unlimited)</label><input type="number" id="newItemStock" placeholder="e.g. 5"></div>
     </div>
+    <label>Section</label>
+    <select id="newItemCategory">${categoryOptions('')}</select>
     <label>Photo (optional)</label>
     <input type="file" accept="image/*" id="newItemImage">
     <div class="small-note">Images are resized automatically to a small thumbnail, so any photo size works fine.</div>
@@ -1263,14 +1315,53 @@ function renderTeacherStore(){
   <div class="card">
     <h3>Store inventory (${db.storeItems.length})</h3>
     ${db.storeItems.length===0 ? `<div class="empty">No items yet.</div>` : `
-    <table><thead><tr><th></th><th>Item</th><th>Price</th><th>Stock</th><th></th></tr></thead><tbody>${rows}</tbody></table>`}
+    <table><thead><tr><th></th><th>Item</th><th>Section</th><th>Price</th><th>Stock</th><th></th></tr></thead><tbody>${rows}</tbody></table>`}
   </div>`;
 }
 function bindStore(){
+  document.getElementById('addCategoryBtn').onclick = async ()=>{
+    const name = document.getElementById('newCategoryName').value.trim();
+    if (!name){ showToast('Enter a section name'); return; }
+    await refreshDb();
+    if (db.storeCategories.some(c=>c.name.toLowerCase()===name.toLowerCase())){ showToast('That section already exists'); render(); return; }
+    db.storeCategories.push({ id:uid('cat'), name });
+    await saveDbWithToast('Section added'); render();
+  };
+  document.querySelectorAll('[data-edit-category]').forEach(b=>{
+    b.onclick = ()=>{ uiState.editingCategoryId = b.dataset.editCategory; render(); };
+  });
+  document.querySelectorAll('[data-cancel-category]').forEach(b=>{
+    b.onclick = ()=>{ uiState.editingCategoryId = null; render(); };
+  });
+  document.querySelectorAll('[data-save-category]').forEach(b=>{
+    b.onclick = async ()=>{
+      const catId = b.dataset.saveCategory;
+      const name = document.getElementById('editCategoryName').value.trim();
+      if (!name){ showToast('Enter a section name'); return; }
+      await refreshDb();
+      const c = db.storeCategories.find(x=>x.id===catId);
+      if (!c){ showToast('This section no longer exists'); uiState.editingCategoryId = null; render(); return; }
+      c.name = name;
+      uiState.editingCategoryId = null;
+      await saveDbWithToast('Section renamed'); render();
+    };
+  });
+  document.querySelectorAll('[data-del-category]').forEach(b=>{
+    b.onclick = async ()=>{
+      const catId = b.dataset.delCategory;
+      const c = db.storeCategories.find(x=>x.id===catId);
+      if (!(await showConfirm(`Delete the "${c ? c.name : ''}" section? Its items won't be deleted — they'll just have no section.`))) return;
+      await refreshDb();
+      db.storeItems.forEach(it=>{ if (it.categoryId === catId) it.categoryId = null; });
+      db.storeCategories = db.storeCategories.filter(x=>x.id!==catId);
+      await saveDbWithToast('Section deleted'); render();
+    };
+  });
   document.getElementById('addItemBtn').onclick = async ()=>{
     const name = document.getElementById('newItemName').value.trim();
     const price = toCents(document.getElementById('newItemPrice').value || '0');
     const stockRaw = document.getElementById('newItemStock').value.trim();
+    const categoryId = document.getElementById('newItemCategory').value || null;
     if (!name || price<=0){ showToast('Enter item name and price'); return; }
     const file = document.getElementById('newItemImage').files[0];
     let image = null;
@@ -1279,7 +1370,7 @@ function bindStore(){
       catch(e){ showToast('Could not read that image — added item without a photo'); }
     }
     await refreshDb();
-    db.storeItems.push({ id:uid('item'), name, price, stock: stockRaw===''?null:parseInt(stockRaw,10), image });
+    db.storeItems.push({ id:uid('item'), name, price, stock: stockRaw===''?null:parseInt(stockRaw,10), categoryId, image });
     await saveDbWithToast('Item added'); render();
   };
   document.querySelectorAll('[data-del-item]').forEach(b=>{
@@ -1302,6 +1393,7 @@ function bindStore(){
       const newName = document.getElementById('editItemName').value.trim();
       const newPrice = toCents(document.getElementById('editItemPrice').value || '0');
       const stockRaw = document.getElementById('editItemStock').value.trim();
+      const newCategoryId = document.getElementById('editItemCategory').value || null;
       if (!newName || newPrice<=0){ showToast('Enter a name and price'); return; }
       await refreshDb();
       const it = db.storeItems.find(x=>x.id===itemId);
@@ -1309,6 +1401,7 @@ function bindStore(){
       it.name = newName;
       it.price = newPrice;
       it.stock = stockRaw==='' ? null : parseInt(stockRaw,10);
+      it.categoryId = newCategoryId;
       uiState.editingStoreItemId = null;
       await saveDbWithToast('Item updated'); render();
     };
@@ -1508,7 +1601,7 @@ function bindSettings(){
       const ok = await showConfirm(`Import this backup? This will REPLACE all current data with the backup (${studentCount} student${studentCount===1?'':'s'} found). This cannot be undone.`);
       e.target.value = '';
       if (!ok) return;
-      db = parsed;
+      db = ensureShape(parsed);
       await saveDbWithToast('Backup restored');
       render();
     }catch(err){
@@ -1842,34 +1935,85 @@ function bindStudentBills(){
   });
 }
 
+function storeVisibleItems(){
+  return db.storeItems.filter(it=> it.stock===null || it.stock>0);
+}
+function isUncategorized(it){
+  return !it.categoryId || !db.storeCategories.some(c=>c.id===it.categoryId);
+}
+function storeCardHtml(it, s){
+  return `
+    <div class="store-item">
+      ${it.image ? `<img class="ithumb" src="${it.image}">` : `<div class="ithumb-placeholder">No photo</div>`}
+      <div class="iname">${escapeHtml(it.name)}</div>
+      <div class="iprice">${money(it.price)}</div>
+      <div class="istock">${it.stock===null?'In stock':it.stock+' left'}</div>
+      <button class="btn sm gold" data-buy-item="${it.id}" ${it.price>s.checking?'disabled':''}>Buy</button>
+    </div>`;
+}
+function storeTabsHtml(){
+  if (db.storeCategories.length === 0) return '';
+  const all = storeVisibleItems();
+  const sel = uiState.storeCategory || 'all';
+  const tab = (key,label,n)=>`<button class="cat-tab ${sel===key?'active':''}" data-store-cat="${key}">${escapeHtml(label)} <span class="cat-count">${n}</span></button>`;
+  let html = tab('all','All',all.length);
+  db.storeCategories.forEach(c=>{
+    const n = all.filter(it=>it.categoryId===c.id).length;
+    if (n > 0) html += tab(c.id, c.name, n);
+  });
+  const other = all.filter(isUncategorized).length;
+  if (other > 0) html += tab('none','Other',other);
+  return `<div class="cat-tabs">${html}</div>`;
+}
+function storeGridHtml(s){
+  const all = storeVisibleItems();
+  const q = (uiState.storeSearch || '').trim().toLowerCase();
+  const sel = uiState.storeCategory || 'all';
+  let items = all.filter(it=> !q || it.name.toLowerCase().includes(q));
+  if (sel === 'none') items = items.filter(isUncategorized);
+  else if (sel !== 'all') items = items.filter(it=>it.categoryId===sel);
+  if (items.length === 0){
+    return `<div class="empty">${all.length===0 ? 'The store is empty right now.' : 'Nothing matches — try another section or a different search.'}</div>`;
+  }
+  // "All" view with sections set up: show each section under its own heading
+  if (sel === 'all' && db.storeCategories.length > 0){
+    let html = '';
+    db.storeCategories.forEach(c=>{
+      const group = items.filter(it=>it.categoryId===c.id);
+      if (group.length) html += `<div class="store-section-title">${escapeHtml(c.name)}</div><div class="store-grid">${group.map(it=>storeCardHtml(it,s)).join('')}</div>`;
+    });
+    const other = items.filter(isUncategorized);
+    if (other.length) html += `<div class="store-section-title">Other</div><div class="store-grid">${other.map(it=>storeCardHtml(it,s)).join('')}</div>`;
+    return html;
+  }
+  return `<div class="store-grid">${items.map(it=>storeCardHtml(it,s)).join('')}</div>`;
+}
 function renderStudentStore(){
   const s = currentStudent();
-  const items = db.storeItems.filter(it=> it.stock===null || it.stock>0);
+  // if the section they were viewing no longer has anything in it, go back to "All"
+  const sel = uiState.storeCategory || 'all';
+  if (sel !== 'all'){
+    const all = storeVisibleItems();
+    const stillThere = sel === 'none' ? all.some(isUncategorized) : all.some(it=>it.categoryId===sel);
+    if (!stillThere) uiState.storeCategory = 'all';
+  }
   const purchases = db.transactions.filter(t=>t.studentId===s.id && t.type==='purchase').sort((a,b)=>b.ts-a.ts);
   return `
   <div class="card">
     <div class="flex-between"><h3 style="margin:0;">Class Store</h3><div class="small-note" style="margin:0;">Checking: <b class="mono">${money(s.checking)}</b></div></div>
   </div>
   <div class="card">
-    ${items.length===0 ? `<div class="empty">The store is empty right now.</div>` : `
-    <div class="store-grid">
-      ${items.map(it=>`
-        <div class="store-item">
-          ${it.image ? `<img class="ithumb" src="${it.image}">` : `<div class="ithumb-placeholder">No photo</div>`}
-          <div class="iname">${escapeHtml(it.name)}</div>
-          <div class="iprice">${money(it.price)}</div>
-          <div class="istock">${it.stock===null?'In stock':it.stock+' left'}</div>
-          <button class="btn sm gold" data-buy-item="${it.id}" ${it.price>s.checking?'disabled':''}>Buy</button>
-        </div>`).join('')}
-    </div>`}
+    <input type="text" id="storeSearch" placeholder="Search the store…" value="${escapeHtml(uiState.storeSearch||'')}">
+    ${storeTabsHtml()}
+    <div id="storeGrid">${storeGridHtml(s)}</div>
   </div>
   <div class="card">
     <h3>My Purchases</h3>
     ${purchases.length===0 ? `<div class="empty">You haven't bought anything yet.</div>` :
-      purchases.map(t=>`<div class="ledger-row"><span>${escapeHtml(t.desc.replace(/^Bought:\\s*/,''))} <span class="small-note" style="margin:0;">— ${fmtDate(t.ts)}</span></span><span class="ledger-amt neg">${money(t.amount)}</span></div>`).join('')}
+      purchases.map(t=>`<div class="ledger-row"><span>${escapeHtml(t.desc.replace(/^Bought:\s*/,''))} <span class="small-note" style="margin:0;">— ${fmtDate(t.ts)}</span></span><span class="ledger-amt neg">${money(t.amount)}</span></div>`).join('')}
   </div>`;
 }
-function bindStudentStore(){
+function bindBuyButtons(){
   document.querySelectorAll('[data-buy-item]').forEach(b=>{
     b.onclick = async ()=>{
       const itemId = b.dataset.buyItem;
@@ -1885,6 +2029,20 @@ function bindStudentStore(){
       await saveDbWithToast(`Bought ${it.name}`); render();
     };
   });
+}
+function bindStudentStore(){
+  bindBuyButtons();
+  document.querySelectorAll('[data-store-cat]').forEach(b=>{
+    b.onclick = ()=>{ uiState.storeCategory = b.dataset.storeCat; render(); };
+  });
+  const search = document.getElementById('storeSearch');
+  if (search){
+    search.oninput = ()=>{
+      uiState.storeSearch = search.value;
+      document.getElementById('storeGrid').innerHTML = storeGridHtml(currentStudent());
+      bindBuyButtons();
+    };
+  }
 }
 
 function renderStudentTransfer(){
