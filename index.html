@@ -299,7 +299,7 @@ const defaultDb = () => ({
 
 let db = null;
 let session = { role: null, studentId: null }; // role: 'teacher' | 'student'
-let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'' };
+let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'', expandedIssues:{} };
 let backendMode = 'none'; // 'firebase' | 'claude-storage' | 'none'
 let lastSynced = null; // copy of what the server held the last time we synced (used to work out exactly what changed)
 let backendLoadError = '';
@@ -435,7 +435,7 @@ const normalizers = {
   students:     r => ({ id:r.id, name:r.name, pin:String(r.pin ?? ''), jobTitle:r.jobTitle ?? '', payAmount:r.payAmount ?? 0, payFreq:r.payFreq ?? 'weekly', householdId:r.householdId ?? null, checking:r.checking ?? 0, savings:r.savings ?? 0 }),
   households:   r => ({ id:r.id, name:r.name ?? '' }),
   bills:        r => { const o = { id:r.id, name:r.name ?? '', amount:r.amount ?? 0, targetType:r.targetType }; if (r.targetId !== undefined) o.targetId = r.targetId; if (r.targetIds !== undefined) o.targetIds = toPlainList(r.targetIds); return o; },
-  charges:      r => ({ id:r.id, billId:r.billId ?? null, billName:r.billName ?? '', studentId:r.studentId, amount:r.amount ?? 0, paid:!!r.paid, createdAt:r.createdAt ?? 0, paidAt:r.paidAt ?? null }),
+  charges:      r => ({ id:r.id, billId:r.billId ?? null, issueId:r.issueId ?? null, billName:r.billName ?? '', studentId:r.studentId, amount:r.amount ?? 0, paid:!!r.paid, createdAt:r.createdAt ?? 0, paidAt:r.paidAt ?? null }),
   storeCategories: r => ({ id:r.id, name:r.name ?? '' }),
   storeItems:   r => ({ id:r.id, name:r.name ?? '', price:r.price ?? 0, stock:(r.stock === undefined ? null : r.stock), categoryId:r.categoryId ?? null, image:r.image ?? null }),
   transactions: r => ({ id:r.id, ts:r.ts ?? 0, studentId:r.studentId, type:r.type, amount:r.amount ?? 0, desc:r.desc ?? '', account:r.account || 'checking' })
@@ -998,6 +998,49 @@ function bindPayroll(){
 }
 
 /* ---- Bills tab ---- */
+function groupCharges(){
+  // One group per time a bill was issued. Newer charges carry an issueId; older ones are
+  // grouped by bill + issued within a minute of each other.
+  const sorted = db.charges.slice().sort((a,b)=>(a.createdAt-b.createdAt) || String(a.id).localeCompare(String(b.id)));
+  const groups = [], byIssue = {};
+  sorted.forEach(c=>{
+    let g = c.issueId ? byIssue[c.issueId] : null;
+    if (!g && !c.issueId){
+      const key = c.billId || c.billName;
+      g = groups.find(x=>!x.issueId && x.billKey===key && Math.abs(c.createdAt - x.firstTs) <= 60000);
+    }
+    if (!g){
+      g = { key:c.id, issueId:c.issueId || null, billKey:c.billId || c.billName, firstTs:c.createdAt, billName:c.billName, charges:[] };
+      groups.push(g);
+      if (c.issueId) byIssue[c.issueId] = g;
+    }
+    g.charges.push(c);
+  });
+  return groups.sort((a,b)=>b.firstTs-a.firstTs);
+}
+function chargeDetailRow(c){
+  const st = getStudent(c.studentId);
+  if (uiState.editingChargeId === c.id){
+    return `<tr>
+      <td>${st?escapeHtml(st.name):'—'}</td>
+      <td><input type="number" step="0.01" id="editChargeAmount" value="${(c.amount/100).toFixed(2)}" style="margin-bottom:0;"></td>
+      <td><label style="display:flex;align-items:center;gap:6px;text-transform:none;font-size:13px;font-weight:400;"><input type="checkbox" id="editChargePaid" ${c.paid?'checked':''} style="width:auto;margin:0;"> Paid</label></td>
+      <td>
+        <button class="btn sm gold" data-save-charge="${c.id}">Save</button>
+        <button class="btn sm ghost" data-cancel-charge="1">Cancel</button>
+      </td>
+    </tr>`;
+  }
+  return `<tr>
+    <td>${st?escapeHtml(st.name):'—'}</td>
+    <td class="mono">${money(c.amount)}</td>
+    <td><span class="pill ${c.paid?'paid':'unpaid'}">${c.paid?'Paid':'Unpaid'}</span></td>
+    <td>
+      <button class="btn sm ghost" data-edit-charge="${c.id}">Edit</button>
+      <button class="icon-btn" data-del-charge="${c.id}">✕</button>
+    </td>
+  </tr>`;
+}
 function renderTeacherBills(){
   const mode = uiState.billTargetMode || 'student';
   const billRows = db.bills.map(b=>{
@@ -1030,30 +1073,29 @@ function renderTeacherBills(){
           <button class="icon-btn" data-del-bill="${b.id}">✕</button></td>
     </tr>`;
   }).join('');
-  const chargeRows = db.charges.slice().sort((a,b)=>b.createdAt-a.createdAt).map(c=>{
-    const s = getStudent(c.studentId);
-    if (uiState.editingChargeId === c.id){
-      return `<tr>
-        <td>${s?escapeHtml(s.name):'—'}</td>
-        <td>${escapeHtml(c.billName)}</td>
-        <td><input type="number" step="0.01" id="editChargeAmount" value="${(c.amount/100).toFixed(2)}" style="margin-bottom:0;"></td>
-        <td><label style="display:flex;align-items:center;gap:6px;text-transform:none;font-size:13px;font-weight:400;"><input type="checkbox" id="editChargePaid" ${c.paid?'checked':''} style="width:auto;margin:0;"> Paid</label></td>
-        <td>
-          <button class="btn sm gold" data-save-charge="${c.id}">Save</button>
-          <button class="btn sm ghost" data-cancel-charge="1">Cancel</button>
-        </td>
-      </tr>`;
-    }
+  const issueGroups = groupCharges();
+  const issuedRows = issueGroups.map(g=>{
+    const n = g.charges.length;
+    const paidN = g.charges.filter(c=>c.paid).length;
+    const amounts = g.charges.map(c=>c.amount);
+    const lo = Math.min(...amounts), hi = Math.max(...amounts);
+    const amountLabel = lo === hi ? (n > 1 ? `${money(lo)} each` : money(lo)) : `${money(amounts.reduce((a,b)=>a+b,0))} total`;
+    const names = g.charges.map(c=>getStudent(c.studentId)?.name).filter(Boolean).sort((a,b)=>a.localeCompare(b));
+    const who = names.slice(0,3).join(', ') + (names.length > 3 ? ` +${names.length-3} more` : '');
+    const allPaid = paidN === n;
+    const open = !!uiState.expandedIssues[g.key] || g.charges.some(c=>c.id===uiState.editingChargeId);
+    const detail = open ? `<tr><td colspan="6" style="background:var(--paper);padding:10px 16px;">
+        <table><thead><tr><th>Student</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+        <tbody>${g.charges.slice().sort((a,b)=>String(getStudent(a.studentId)?.name||'').localeCompare(String(getStudent(b.studentId)?.name||''))).map(chargeDetailRow).join('')}</tbody></table>
+      </td></tr>` : '';
     return `<tr>
-      <td>${s?escapeHtml(s.name):'—'}</td>
-      <td>${escapeHtml(c.billName)}</td>
-      <td class="mono">${money(c.amount)}</td>
-      <td><span class="pill ${c.paid?'paid':'unpaid'}">${c.paid?'Paid':'Unpaid'}</span></td>
-      <td class="small-note" style="margin:0;">${fmtDate(c.createdAt)}
-        <button class="btn sm ghost" data-edit-charge="${c.id}" style="margin-left:6px;">Edit</button>
-        <button class="icon-btn" data-del-charge="${c.id}">✕</button>
-      </td>
-    </tr>`;
+      <td>${escapeHtml(g.billName)}</td>
+      <td class="mono">${amountLabel}</td>
+      <td>${escapeHtml(who || '—')}</td>
+      <td><span class="pill ${allPaid?'paid':'unpaid'}">${allPaid ? 'All paid' : `${paidN} of ${n} paid`}</span></td>
+      <td class="small-note" style="margin:0;">${fmtDate(g.firstTs)}</td>
+      <td><button class="btn sm ghost" data-toggle-issue="${g.key}">${open?'Hide':'Details'}</button></td>
+    </tr>${detail}`;
   }).join('');
   const modeNote = {
     student: "Charges one student the full amount.",
@@ -1101,21 +1143,23 @@ function renderTeacherBills(){
     <table><thead><tr><th>Name</th><th>Amount</th><th>Target</th><th></th></tr></thead><tbody>${billRows}</tbody></table>`}
   </div>
   <div class="card">
-    <h3>Charge history (${db.charges.length})</h3>
-    ${db.charges.length===0 ? `<div class="empty">No charges issued yet.</div>` : `
-    <table><thead><tr><th>Student</th><th>Bill</th><th>Amount</th><th>Status</th><th>Date</th></tr></thead><tbody>${chargeRows}</tbody></table>`}
+    <h3>Issued bills (${issueGroups.length})</h3>
+    <div class="small-note">One row per bill you've issued. Click <b>Details</b> to see each student, or to edit or delete a single charge.</div>
+    ${issueGroups.length===0 ? `<div class="empty">No bills issued yet.</div>` : `
+    <table><thead><tr><th>Bill</th><th>Amount</th><th>Charged to</th><th>Paid</th><th>Issued</th><th></th></tr></thead><tbody>${issuedRows}</tbody></table>`}
   </div>`;
 }
 function issueChargeForBill(bill){
+  const issueId = uid('iss');
+  const now = nowTs();
+  const mk = (studentId, amount, billName)=>({ id:uid('chg'), billId:bill.id, issueId, billName, studentId, amount, paid:false, createdAt:now, paidAt:null });
   if (bill.targetType === 'student'){
-    db.charges.push({ id:uid('chg'), billId:bill.id, billName:bill.name, studentId:bill.targetId, amount:bill.amount, paid:false, createdAt:nowTs(), paidAt:null });
+    db.charges.push(mk(bill.targetId, bill.amount, bill.name));
     return 1;
   }
   if (bill.targetType === 'students'){
     const targets = (bill.targetIds||[]).filter(id=>getStudent(id));
-    targets.forEach(sid=>{
-      db.charges.push({ id:uid('chg'), billId:bill.id, billName:bill.name, studentId:sid, amount:bill.amount, paid:false, createdAt:nowTs(), paidAt:null });
-    });
+    targets.forEach(sid=>{ db.charges.push(mk(sid, bill.amount, bill.name)); });
     return targets.length;
   }
   // Household: split the bill evenly. Remainder cents (if the amount doesn't
@@ -1128,7 +1172,7 @@ function issueChargeForBill(bill){
   targets.forEach(sid=>{
     const share = base + (remainder > 0 ? 1 : 0);
     if (remainder > 0) remainder--;
-    db.charges.push({ id:uid('chg'), billId:bill.id, billName:bill.name + ` (split ${targets.length} ways)`, studentId:sid, amount:share, paid:false, createdAt:nowTs(), paidAt:null });
+    db.charges.push(mk(sid, share, bill.name + ` (split ${targets.length} ways)`));
   });
   return targets.length;
 }
@@ -1201,6 +1245,9 @@ function bindBills(){
       uiState.editingBillId = null;
       await saveDbWithToast('Bill template updated'); render();
     };
+  });
+  document.querySelectorAll('[data-toggle-issue]').forEach(b=>{
+    b.onclick = ()=>{ const k = b.dataset.toggleIssue; uiState.expandedIssues[k] = !uiState.expandedIssues[k]; render(); };
   });
   document.querySelectorAll('[data-edit-charge]').forEach(b=>{
     b.onclick = ()=>{ uiState.editingChargeId = b.dataset.editCharge; render(); };
