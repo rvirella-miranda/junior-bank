@@ -363,6 +363,15 @@
   .toast{ background:var(--plum-dark); color:#FCFAF5; border-radius:999px; padding:11px 22px; font-weight:500; }
   .confirm-overlay{ background:rgba(47,42,59,.5); }
   .confirm-box{ background:#FFFEFB; border:2px solid var(--plum); border-radius:14px; box-shadow:8px 8px 0 rgba(125,106,158,.3); }
+
+  /* transaction filters */
+  input[type=date]{ width:100%; padding:10px 12px; border:1.5px solid #B9B2C4; border-radius:10px; font-size:14px; background:#FFFEFB; color:var(--ink); font-family:'Poppins',sans-serif; margin-bottom:12px; }
+  input[type=date]:focus{ outline:2px solid var(--lav); outline-offset:1px; border-color:var(--lav); }
+  .checkline{ display:flex; align-items:center; gap:8px; text-transform:none; letter-spacing:0; font-weight:500; font-size:13.5px; color:var(--ink); margin:0 0 10px 0; cursor:pointer; }
+  .checkline input{ width:auto; margin:0; }
+  .sub-row td{ background:var(--paper); }
+  .sub-row td:first-child{ padding-left:26px; border-left:4px solid var(--lavender); }
+  .ledger-row.sub-line{ padding-left:18px; margin-left:6px; border-left:4px solid var(--lavender); font-size:13px; background:var(--paper); }
 </style>
 </head>
 <body>
@@ -412,7 +421,7 @@ const defaultDb = () => ({
 
 let db = null;
 let session = { role: null, studentId: null }; // role: 'teacher' | 'student'
-let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'', expandedIssues:{} };
+let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'', expandedIssues:{}, ledgerType:'all', ledgerSearch:'', ledgerFrom:'', ledgerTo:'', ledgerGroup:true, expandedTx:{}, actType:'all', actSearch:'', actFrom:'', actTo:'', actGroup:true, expandedStx:{} };
 let backendMode = 'none'; // 'firebase' | 'claude-storage' | 'none'
 let lastSynced = null; // copy of what the server held the last time we synced (used to work out exactly what changed)
 let backendLoadError = '';
@@ -779,7 +788,7 @@ function bindLogin(){
   const tBtn = document.getElementById('teacherLoginBtn');
   if (tBtn) tBtn.onclick = ()=>{
     const pin = document.getElementById('teacherPinInput').value.trim();
-    if (pin === db.teacherPin){ session.role='teacher'; uiState.loginError=''; render(); }
+    if (pin === db.teacherPin){ session.role='teacher'; uiState.loginError=''; resetTxFilters(); render(); }
     else { uiState.loginError = 'Incorrect PIN.'; render(); }
   };
   const sBtn = document.getElementById('studentLoginBtn');
@@ -787,7 +796,7 @@ function bindLogin(){
     const id = document.getElementById('studentSelect').value;
     const pin = document.getElementById('studentPinInput').value.trim();
     const s = getStudent(id);
-    if (s && pin === s.pin){ session.role='student'; session.studentId=id; uiState.loginError=''; uiState.studentTab='home'; render(); }
+    if (s && pin === s.pin){ session.role='student'; session.studentId=id; uiState.loginError=''; uiState.studentTab='home'; resetTxFilters(); render(); }
     else { uiState.loginError = 'Incorrect PIN.'; render(); }
   };
 }
@@ -809,7 +818,7 @@ function renderTeacherShell(){
   <div class="content" id="teacherContent"></div>`;
 }
 function bindTeacherShell(){
-  document.getElementById('logoutBtn').onclick = ()=>{ session={role:null,studentId:null}; render(); };
+  document.getElementById('logoutBtn').onclick = ()=>{ session={role:null,studentId:null}; resetTxFilters(); render(); };
   document.querySelectorAll('.tab').forEach(btn=>{
     btn.onclick = async ()=>{
       uiState.teacherTab = btn.dataset.tab;
@@ -1608,45 +1617,143 @@ function bindStore(){
 }
 
 /* ---- Ledger tab ---- */
+/* ---------- transaction filters + combining repeat purchases (used by teacher Ledger and student Activity) ---------- */
+const TX_TYPE_FILTERS = [
+  ['all','All types'],
+  ['payday','Paychecks'],
+  ['bill-payment','Bill payments'],
+  ['purchase','Purchases'],
+  ['transfer-out','Money sent to classmates'],
+  ['transfer-in','Money received from classmates'],
+  ['internal','Checking ⇄ Savings moves'],
+  ['adjustment','Adjustments & corrections']
+];
+function txTypeOptionsHtml(selected){
+  return TX_TYPE_FILTERS.map(([k,l])=>`<option value="${k}" ${k===(selected||'all')?'selected':''}>${l}</option>`).join('');
+}
+function filterTransactions(txs, f, includeStudentNames){
+  const q = (f.search || '').trim().toLowerCase();
+  const from = f.from ? new Date(f.from + 'T00:00:00').getTime() : null;
+  const to = f.to ? new Date(f.to + 'T23:59:59.999').getTime() : null;
+  return txs.filter(t=>{
+    if (f.type && f.type !== 'all' && t.type !== f.type) return false;
+    if (from !== null && t.ts < from) return false;
+    if (to !== null && t.ts > to) return false;
+    if (q){
+      const hay = (String(t.desc || '') + ' ' + String(t.type || '') + (includeStudentNames ? ' ' + (getStudent(t.studentId)?.name || '') : '')).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+function itemNameOf(t){ return String(t.desc || '').replace(/^Bought:\s*/, ''); }
+// Newest first. When groupOn is true, repeat purchases of the same item (same student, same
+// price) become ONE entry with a quantity; everything else stays a normal line.
+function groupTxsForDisplay(txs, groupOn){
+  const sorted = txs.slice().sort((a,b)=>b.ts-a.ts);
+  if (!groupOn) return sorted.map(t=>({ kind:'single', tx:t, ts:t.ts }));
+  const out = [], groups = {};
+  sorted.forEach(t=>{
+    if (t.type !== 'purchase'){ out.push({ kind:'single', tx:t, ts:t.ts }); return; }
+    const key = t.studentId + '|' + t.desc + '|' + t.amount;
+    let g = groups[key];
+    if (!g){ g = { kind:'group', studentId:t.studentId, item:itemNameOf(t), unit:t.amount, txs:[], ts:t.ts }; groups[key] = g; out.push(g); }
+    g.txs.push(t);
+  });
+  return out.map(e=>{
+    if (e.kind !== 'group') return e;
+    if (e.txs.length === 1) return { kind:'single', tx:e.txs[0], ts:e.ts };
+    const oldest = e.txs[e.txs.length-1];
+    return { ...e, qty:e.txs.length, total:e.txs.reduce((a,t)=>a+t.amount,0), firstTs:oldest.ts, id:oldest.id };
+  });
+}
+function txSummaryHtml(txs){
+  let inn = 0, out = 0;
+  txs.forEach(t=>{ if (t.type === 'internal') return; if (t.amount > 0) inn += t.amount; else out += -t.amount; });
+  return `<div class="small-note" style="margin:0 0 12px 0;"><b>${txs.length}</b> transaction${txs.length===1?'':'s'} · Money in <b class="mono" style="color:#2F5D3A;">+${money(inn)}</b> · Money out <b class="mono" style="color:var(--rust);">−${money(out)}</b> <span style="opacity:.8;">(moves between checking and savings aren't counted)</span></div>`;
+}
+function resetTxFilters(){
+  Object.assign(uiState, { ledgerFilter:'', ledgerType:'all', ledgerSearch:'', ledgerFrom:'', ledgerTo:'', ledgerGroup:true, expandedTx:{},
+                           actType:'all', actSearch:'', actFrom:'', actTo:'', actGroup:true, expandedStx:{} });
+}
+
+function ledgerTxRow(t, sub){
+  const s = getStudent(t.studentId);
+  const pos = t.amount >= 0;
+  const cls = sub ? ' class="sub-row"' : '';
+  if (uiState.editingLedgerTxId === t.id){
+    return `<tr${cls}>
+      <td>${fmtDate(t.ts)}</td>
+      <td>${s?escapeHtml(s.name):'—'}</td>
+      <td>${escapeHtml(t.desc)}</td>
+      <td><span class="pill ${pos?'income':'expense'}">${t.type}</span></td>
+      <td colspan="2"><input type="number" step="0.01" id="editLedgerAmount" value="${(t.amount/100).toFixed(2)}" style="margin-bottom:0;"> <span class="small-note" style="display:inline;">(use a minus sign for a charge/expense)</span></td>
+    </tr>
+    <tr${cls}><td colspan="6" style="text-align:right;padding-top:0;">
+      <button class="btn sm gold" data-save-ledger="${t.id}">Save</button>
+      <button class="btn sm ghost" data-cancel-ledger="1">Cancel</button>
+    </td></tr>`;
+  }
+  return `<tr${cls}>
+    <td>${fmtDate(t.ts)}</td>
+    <td>${s?escapeHtml(s.name):'—'}</td>
+    <td>${escapeHtml(t.desc)}</td>
+    <td><span class="pill ${pos?'income':'expense'}">${t.type}</span></td>
+    <td class="mono ledger-amt ${pos?'pos':'neg'}">${pos?'+':''}${money(t.amount)}</td>
+    <td><button class="btn sm ghost" data-edit-ledger="${t.id}">Edit</button>
+        <button class="icon-btn" data-del-ledger="${t.id}">✕</button></td>
+  </tr>`;
+}
+function ledgerGroupRows(g){
+  const st = getStudent(g.studentId);
+  const open = !!uiState.expandedTx[g.id] || g.txs.some(t=>t.id===uiState.editingLedgerTxId);
+  const first = (fmtDate(g.firstTs) !== fmtDate(g.ts)) ? ` · first bought ${fmtDate(g.firstTs)}` : '';
+  let html = `<tr>
+    <td>${fmtDate(g.ts)}</td>
+    <td>${st?escapeHtml(st.name):'—'}</td>
+    <td><b>${escapeHtml(g.item)} × ${g.qty}</b><div class="small-note" style="margin:2px 0 0 0;">${money(Math.abs(g.unit))} each${first}</div></td>
+    <td><span class="pill expense">purchase</span></td>
+    <td class="mono ledger-amt neg">${money(g.total)}</td>
+    <td><button class="btn sm ghost" data-toggle-tx="${g.id}">${open?'Hide':'Details'}</button></td>
+  </tr>`;
+  if (open) html += g.txs.map(t=>ledgerTxRow(t, true)).join('');
+  return html;
+}
+function ledgerResultsHtml(){
+  const filterId = uiState.ledgerFilter || '';
+  const base = db.transactions.filter(t=> !filterId || t.studentId===filterId);
+  if (base.length === 0) return `<div class="empty">No transactions yet.</div>`;
+  const txs = filterTransactions(base, { type:uiState.ledgerType, from:uiState.ledgerFrom, to:uiState.ledgerTo, search:uiState.ledgerSearch }, true);
+  if (txs.length === 0) return `<div class="empty">No transactions match these filters.</div>`;
+  const entries = groupTxsForDisplay(txs, uiState.ledgerGroup);
+  const LIMIT = 300;
+  const rows = entries.slice(0, LIMIT).map(e=> e.kind === 'group' ? ledgerGroupRows(e) : ledgerTxRow(e.tx, false)).join('');
+  return `${txSummaryHtml(txs)}
+    <table><thead><tr><th>Date</th><th>Student</th><th>Description</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+    ${entries.length > LIMIT ? `<div class="small-note" style="margin-top:10px;">Showing the newest ${LIMIT} lines of ${entries.length}. Use the filters above to narrow it down.</div>` : ''}`;
+}
 function renderTeacherLedger(){
   const sortedStudents = db.students.slice().sort((a,b)=>a.name.localeCompare(b.name));
   const filterOpts = `<option value="">All students</option>` + sortedStudents.map(s=>`<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
   const filterId = uiState.ledgerFilter || '';
   const filteredStudent = filterId ? getStudent(filterId) : null;
-  const txs = db.transactions.filter(t=> !filterId || t.studentId===filterId).slice().sort((a,b)=>b.ts-a.ts).slice(0,200);
-  const rows = txs.map(t=>{
-    const s = getStudent(t.studentId);
-    const pos = t.amount >= 0;
-    if (uiState.editingLedgerTxId === t.id){
-      return `<tr>
-        <td>${fmtDate(t.ts)}</td>
-        <td>${s?escapeHtml(s.name):'—'}</td>
-        <td>${escapeHtml(t.desc)}</td>
-        <td><span class="pill ${pos?'income':'expense'}">${t.type}</span></td>
-        <td colspan="2"><input type="number" step="0.01" id="editLedgerAmount" value="${(t.amount/100).toFixed(2)}" style="margin-bottom:0;"> <span class="small-note" style="display:inline;">(use a minus sign for a charge/expense)</span></td>
-      </tr>
-      <tr><td colspan="6" style="text-align:right;padding-top:0;">
-        <button class="btn sm gold" data-save-ledger="${t.id}">Save</button>
-        <button class="btn sm ghost" data-cancel-ledger="1">Cancel</button>
-      </td></tr>`;
-    }
-    return `<tr>
-      <td>${fmtDate(t.ts)}</td>
-      <td>${s?escapeHtml(s.name):'—'}</td>
-      <td>${escapeHtml(t.desc)}</td>
-      <td><span class="pill ${pos?'income':'expense'}">${t.type}</span></td>
-      <td class="mono ledger-amt ${pos?'pos':'neg'}">${pos?'+':''}${money(t.amount)}</td>
-      <td><button class="btn sm ghost" data-edit-ledger="${t.id}">Edit</button>
-          <button class="icon-btn" data-del-ledger="${t.id}">✕</button></td>
-    </tr>`;
-  }).join('');
   return `
   <div class="card">
-    <div class="row-inline">
-      <div><label>Filter by student</label><select id="ledgerFilterSelect">${filterOpts}</select></div>
+    <div class="grid3">
+      <div><label>Student</label><select id="ledgerFilterSelect">${filterOpts}</select></div>
+      <div><label>Type</label><select id="ledgerType">${txTypeOptionsHtml(uiState.ledgerType)}</select></div>
+      <div><label>Search</label><input type="text" id="ledgerSearch" placeholder="Item, bill, or name…" value="${escapeHtml(uiState.ledgerSearch||'')}"></div>
+    </div>
+    <div class="grid3">
+      <div><label>From</label><input type="date" id="ledgerFrom" value="${uiState.ledgerFrom||''}"></div>
+      <div><label>To</label><input type="date" id="ledgerTo" value="${uiState.ledgerTo||''}"></div>
+      <div style="padding-top:22px;">
+        <label class="checkline"><input type="checkbox" id="ledgerGroup" ${uiState.ledgerGroup?'checked':''}> Combine repeat purchases</label>
+        <button class="btn sm ghost" id="ledgerClear">Clear filters</button>
+      </div>
     </div>
     ${filteredStudent ? `
-      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:6px;padding-top:14px;border-top:1px solid var(--line);">
+      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:6px;padding-top:14px;border-top:1px dashed #CFC8DA;">
         <div><div class="small-note" style="margin:0;">Checking</div><div class="mono" style="font-size:20px;font-weight:600;color:var(--teal);">${money(filteredStudent.checking)}</div></div>
         <div><div class="small-note" style="margin:0;">Savings</div><div class="mono" style="font-size:20px;font-weight:600;color:var(--savings-blue);">${money(filteredStudent.savings)}</div></div>
         <div><div class="small-note" style="margin:0;">Job</div><div style="font-size:14px;">${escapeHtml(filteredStudent.jobTitle||'—')}</div></div>
@@ -1655,15 +1762,37 @@ function renderTeacherLedger(){
   </div>
   <div class="card">
     <h3>Transaction ledger</h3>
-    <div class="small-note">Editing or deleting a transaction adjusts that student's balance automatically. Note: transfers between students and checking↔savings moves create two linked rows — you may need to fix both sides.</div>
-    ${txs.length===0 ? `<div class="empty">No transactions yet.</div>` : `
-    <table><thead><tr><th>Date</th><th>Student</th><th>Description</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table>`}
+    <div class="small-note">Editing or deleting a transaction adjusts that student's balance automatically. Repeat purchases are combined into one line — click <b>Details</b> to edit or delete a single one. Transfers between students and checking↔savings moves create two linked rows — you may need to fix both sides.</div>
+    <div id="ledgerResults">${ledgerResultsHtml()}</div>
   </div>`;
+}
+function refreshLedgerResults(){
+  const box = document.getElementById('ledgerResults');
+  if (!box) return;
+  box.innerHTML = ledgerResultsHtml();
+  bindLedgerRows();
 }
 function bindLedger(){
   const sel = document.getElementById('ledgerFilterSelect');
   sel.value = uiState.ledgerFilter || '';
   sel.onchange = ()=>{ uiState.ledgerFilter = sel.value; render(); };
+  const type = document.getElementById('ledgerType');
+  type.onchange = ()=>{ uiState.ledgerType = type.value; refreshLedgerResults(); };
+  const search = document.getElementById('ledgerSearch');
+  search.oninput = ()=>{ uiState.ledgerSearch = search.value; refreshLedgerResults(); };
+  const from = document.getElementById('ledgerFrom');
+  from.onchange = from.oninput = ()=>{ uiState.ledgerFrom = from.value; refreshLedgerResults(); };
+  const to = document.getElementById('ledgerTo');
+  to.onchange = to.oninput = ()=>{ uiState.ledgerTo = to.value; refreshLedgerResults(); };
+  const grp = document.getElementById('ledgerGroup');
+  grp.onchange = ()=>{ uiState.ledgerGroup = grp.checked; refreshLedgerResults(); };
+  document.getElementById('ledgerClear').onclick = ()=>{ resetTxFilters(); render(); };
+  bindLedgerRows();
+}
+function bindLedgerRows(){
+  document.querySelectorAll('[data-toggle-tx]').forEach(b=>{
+    b.onclick = ()=>{ const k = b.dataset.toggleTx; uiState.expandedTx[k] = !uiState.expandedTx[k]; refreshLedgerResults(); };
+  });
   document.querySelectorAll('[data-edit-ledger]').forEach(b=>{
     b.onclick = ()=>{ uiState.editingLedgerTxId = b.dataset.editLedger; render(); };
   });
@@ -1854,7 +1983,7 @@ function renderStudentShell(){
   <div class="content" id="studentContent"></div>`;
 }
 function bindStudentShell(){
-  document.getElementById('logoutBtn').onclick = ()=>{ session={role:null,studentId:null}; render(); };
+  document.getElementById('logoutBtn').onclick = ()=>{ session={role:null,studentId:null}; resetTxFilters(); render(); };
   document.querySelectorAll('.tab').forEach(btn=>{
     btn.onclick = async ()=>{
       uiState.studentTab = btn.dataset.tab;
@@ -1873,7 +2002,7 @@ function renderStudentHome(){
   const s = currentStudent();
   const hh = s.householdId ? getHousehold(s.householdId) : null;
   const unpaid = db.charges.filter(c=>c.studentId===s.id && !c.paid);
-  const recent = db.transactions.filter(t=>t.studentId===s.id).sort((a,b)=>b.ts-a.ts).slice(0,6);
+  const recent = groupTxsForDisplay(db.transactions.filter(t=>t.studentId===s.id), true).slice(0,6);
   return `
   <div class="passbook">
     <div class="eyebrow">Account holder</div>
@@ -1890,7 +2019,7 @@ function renderStudentHome(){
   <div class="card">
     <h3>Recent activity</h3>
     ${recent.length===0 ? `<div class="empty">Nothing yet — activity will show up here.</div>` :
-      recent.map(t=>`<div class="ledger-row"><span>${escapeHtml(t.desc)}</span><span class="ledger-amt ${t.amount>=0?'pos':'neg'}">${t.amount>=0?'+':''}${money(t.amount)}</span></div>`).join('')}
+      recent.map(e=>{ const amt = e.kind==='group' ? e.total : e.tx.amount; const label = e.kind==='group' ? `${escapeHtml(e.item)} × ${e.qty}` : escapeHtml(e.tx.desc); return `<div class="ledger-row"><span>${label}</span><span class="ledger-amt ${amt>=0?'pos':'neg'}">${amt>=0?'+':''}${money(amt)}</span></div>`; }).join('')}
   </div>`;
 }
 
@@ -2233,7 +2362,7 @@ function renderStudentStore(){
     const stillThere = sel === 'none' ? all.some(isUncategorized) : all.some(it=>it.categoryId===sel);
     if (!stillThere) uiState.storeCategory = 'all';
   }
-  const purchases = db.transactions.filter(t=>t.studentId===s.id && t.type==='purchase').sort((a,b)=>b.ts-a.ts);
+  const purchases = groupTxsForDisplay(db.transactions.filter(t=>t.studentId===s.id && t.type==='purchase'), true);
   return `
   <div class="card">
     <div class="flex-between"><h3 style="margin:0;">Class Store</h3><div class="small-note" style="margin:0;">Checking: <b class="mono">${money(s.checking)}</b></div></div>
@@ -2246,7 +2375,9 @@ function renderStudentStore(){
   <div class="card">
     <h3>My Purchases</h3>
     ${purchases.length===0 ? `<div class="empty">You haven't bought anything yet.</div>` :
-      purchases.map(t=>`<div class="ledger-row"><span>${escapeHtml(t.desc.replace(/^Bought:\s*/,''))} <span class="small-note" style="margin:0;">— ${fmtDate(t.ts)}</span></span><span class="ledger-amt neg">${money(t.amount)}</span></div>`).join('')}
+      purchases.map(e=> e.kind==='group'
+        ? `<div class="ledger-row"><span><b>${escapeHtml(e.item)} × ${e.qty}</b> <span class="small-note" style="margin:0;">— last bought ${fmtDate(e.ts)}</span></span><span class="ledger-amt neg">${money(e.total)}</span></div>`
+        : `<div class="ledger-row"><span>${escapeHtml(itemNameOf(e.tx))} <span class="small-note" style="margin:0;">— ${fmtDate(e.ts)}</span></span><span class="ledger-amt neg">${money(e.tx.amount)}</span></div>`).join('')}
   </div>`;
 }
 function bindBuyButtons(){
@@ -2323,21 +2454,69 @@ function bindStudentTransfer(){
   };
 }
 
+function activityResultsHtml(st){
+  const base = db.transactions.filter(t=>t.studentId===st.id);
+  if (base.length === 0) return `<div class="empty">No activity yet.</div>`;
+  const txs = filterTransactions(base, { type:uiState.actType, from:uiState.actFrom, to:uiState.actTo, search:uiState.actSearch }, false);
+  if (txs.length === 0) return `<div class="empty">Nothing matches these filters.</div>`;
+  const entries = groupTxsForDisplay(txs, uiState.actGroup);
+  const rows = entries.map(e=>{
+    if (e.kind === 'single'){
+      const t = e.tx;
+      return `<div class="ledger-row"><span>${fmtDate(t.ts)} — ${escapeHtml(t.desc)}</span><span class="ledger-amt ${t.amount>=0?'pos':'neg'}">${t.amount>=0?'+':''}${money(t.amount)}</span></div>`;
+    }
+    const open = !!uiState.expandedStx[e.id];
+    let html = `<div class="ledger-row">
+      <span><b>${escapeHtml(e.item)} × ${e.qty}</b> <span class="small-note" style="margin:0;">${money(Math.abs(e.unit))} each · last bought ${fmtDate(e.ts)}</span></span>
+      <span style="display:flex;align-items:center;gap:10px;"><span class="ledger-amt neg">${money(e.total)}</span><button class="btn sm ghost" data-toggle-stx="${e.id}">${open?'Hide':'Details'}</button></span>
+    </div>`;
+    if (open) html += e.txs.map(t=>`<div class="ledger-row sub-line"><span>${fmtDate(t.ts)}</span><span class="ledger-amt neg">${money(t.amount)}</span></div>`).join('');
+    return html;
+  }).join('');
+  return txSummaryHtml(txs) + rows;
+}
 function renderStudentActivity(){
-  const s = currentStudent();
-  const txs = db.transactions.filter(t=>t.studentId===s.id).sort((a,b)=>b.ts-a.ts);
-  const totalIn = txs.filter(t=>t.amount>0).reduce((a,t)=>a+t.amount,0);
-  const totalOut = txs.filter(t=>t.amount<0).reduce((a,t)=>a+t.amount,0);
+  const st = currentStudent();
   return `
-  <div class="card grid2">
-    <div><div class="small-note">Total earned</div><div class="mono" style="font-size:20px;color:var(--teal);">${money(totalIn)}</div></div>
-    <div><div class="small-note">Total spent</div><div class="mono" style="font-size:20px;color:var(--rust);">${money(totalOut)}</div></div>
+  <div class="card">
+    <h3>Find a transaction</h3>
+    <div class="grid3">
+      <div><label>Type</label><select id="actType">${txTypeOptionsHtml(uiState.actType)}</select></div>
+      <div><label>From</label><input type="date" id="actFrom" value="${uiState.actFrom||''}"></div>
+      <div><label>To</label><input type="date" id="actTo" value="${uiState.actTo||''}"></div>
+    </div>
+    <div class="grid2">
+      <div><label>Search</label><input type="text" id="actSearch" placeholder="Item, bill, or name…" value="${escapeHtml(uiState.actSearch||'')}"></div>
+      <div style="padding-top:22px;">
+        <label class="checkline"><input type="checkbox" id="actGroup" ${uiState.actGroup?'checked':''}> Combine repeat purchases</label>
+        <button class="btn sm ghost" id="actClear">Clear filters</button>
+      </div>
+    </div>
   </div>
   <div class="card">
-    <h3>Full history</h3>
-    ${txs.length===0 ? `<div class="empty">No activity yet.</div>` :
-      txs.map(t=>`<div class="ledger-row"><span>${fmtDate(t.ts)} — ${escapeHtml(t.desc)}</span><span class="ledger-amt ${t.amount>=0?'pos':'neg'}">${t.amount>=0?'+':''}${money(t.amount)}</span></div>`).join('')}
+    <h3>History</h3>
+    <div id="activityResults">${activityResultsHtml(st)}</div>
   </div>`;
+}
+function bindStudentActivity(){
+  const refresh = ()=>{
+    const box = document.getElementById('activityResults');
+    if (!box) return;
+    box.innerHTML = activityResultsHtml(currentStudent());
+    bindRows();
+  };
+  const bindRows = ()=>{
+    document.querySelectorAll('[data-toggle-stx]').forEach(b=>{
+      b.onclick = ()=>{ const k = b.dataset.toggleStx; uiState.expandedStx[k] = !uiState.expandedStx[k]; refresh(); };
+    });
+  };
+  const type = document.getElementById('actType');   type.onchange = ()=>{ uiState.actType = type.value; refresh(); };
+  const from = document.getElementById('actFrom');   from.onchange = from.oninput = ()=>{ uiState.actFrom = from.value; refresh(); };
+  const to = document.getElementById('actTo');       to.onchange = to.oninput = ()=>{ uiState.actTo = to.value; refresh(); };
+  const search = document.getElementById('actSearch'); search.oninput = ()=>{ uiState.actSearch = search.value; refresh(); };
+  const grp = document.getElementById('actGroup');   grp.onchange = ()=>{ uiState.actGroup = grp.checked; refresh(); };
+  document.getElementById('actClear').onclick = ()=>{ resetTxFilters(); render(); };
+  bindRows();
 }
 
 function bindStudentTab(tab){
@@ -2347,6 +2526,7 @@ function bindStudentTab(tab){
   if (tab==='bills') bindStudentBills();
   if (tab==='store') bindStudentStore();
   if (tab==='transfer') bindStudentTransfer();
+  if (tab==='activity') bindStudentActivity();
 }
 function bindStudentHousehold(){
   document.querySelectorAll('[data-quick-send]').forEach(b=>{
