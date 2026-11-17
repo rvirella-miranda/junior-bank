@@ -503,7 +503,7 @@ const defaultDb = () => ({
 
 let db = null;
 let session = { role: null, studentId: null }; // role: 'teacher' | 'student'
-let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'', expandedIssues:{}, ledgerType:'all', ledgerSearch:'', ledgerFrom:'', ledgerTo:'', ledgerGroup:true, expandedTx:{}, actType:'all', actSearch:'', actFrom:'', actTo:'', actGroup:true, expandedStx:{} };
+let uiState = { teacherTab:'students', studentTab:'home', loginRole:'student', loginError:'', editingChargeId:null, editingPayrollId:null, billTargetMode:'student', editingLedgerTxId:null, ledgerFilter:'', editingBillId:null, editingStoreItemId:null, editingCategoryId:null, storeCategory:'all', storeSearch:'', expandedIssues:{}, ledgerType:'all', ledgerSearch:'', ledgerFrom:'', ledgerTo:'', ledgerGroup:true, expandedTx:{}, actType:'all', actSearch:'', actFrom:'', actTo:'', actGroup:true, expandedStx:{}, tsMode:'student', tsAmount:'', tsNote:'', tsAccount:'checking' };
 let backendMode = 'none'; // 'firebase' | 'claude-storage' | 'none'
 let lastSynced = null; // copy of what the server held the last time we synced (used to work out exactly what changed)
 let backendLoadError = '';
@@ -642,7 +642,7 @@ const normalizers = {
   charges:      r => ({ id:r.id, billId:r.billId ?? null, issueId:r.issueId ?? null, billName:r.billName ?? '', studentId:r.studentId, amount:r.amount ?? 0, paid:!!r.paid, createdAt:r.createdAt ?? 0, paidAt:r.paidAt ?? null }),
   storeCategories: r => ({ id:r.id, name:r.name ?? '' }),
   storeItems:   r => ({ id:r.id, name:r.name ?? '', price:r.price ?? 0, stock:(r.stock === undefined ? null : r.stock), categoryId:r.categoryId ?? null, image:r.image ?? null }),
-  transactions: r => ({ id:r.id, ts:r.ts ?? 0, studentId:r.studentId, type:r.type, amount:r.amount ?? 0, desc:r.desc ?? '', account:r.account || 'checking' })
+  transactions: r => ({ id:r.id, ts:r.ts ?? 0, studentId:r.studentId, type:r.type, amount:r.amount ?? 0, desc:r.desc ?? '', account:r.account || 'checking', batchId:r.batchId ?? null })
 };
 function snapshotToDb(raw){
   raw = raw || {};
@@ -780,8 +780,10 @@ async function saveDbWithToast(successMessage){
   if (ok) showToast(successMessage);
   return ok;
 }
-function addTx(studentId, type, amountCents, desc, account){
-  db.transactions.push({ id:uid('tx'), ts:nowTs(), studentId, type, amount:amountCents, desc, account: account || 'checking' });
+function addTx(studentId, type, amountCents, desc, account, batchId){
+  const t = { id:uid('tx'), ts:nowTs(), studentId, type, amount:amountCents, desc, account: account || 'checking' };
+  if (batchId) t.batchId = batchId;
+  db.transactions.push(t);
 }
 function getStudent(id){ return db.students.find(s=>s.id===id); }
 function getHousehold(id){ return db.households.find(h=>h.id===id); }
@@ -885,12 +887,12 @@ function bindLogin(){
 
 /* ---------------- TEACHER SHELL ---------------- */
 const TEACHER_TABS = [
-  ['students','Students'],['households','Households'],['payroll','Payroll'],
+  ['students','Students'],['households','Households'],['payroll','Payroll'],['send','Send Money'],
   ['bills','Bills'],['store','Store'],['ledger','Ledger'],['settings','Settings']
 ];
 const BAND_HEX = { pink:'#F9E9EE', mint:'#E3F0E7', butter:'#F9F0DC', lav:'#EEE6F4', sky:'#E4ECF6' };
 const STUDENT_LOOK = { home:['🏠','pink'], dashboard:['📈','mint'], household:['🏡','butter'], send:['💸','lav'], bills:['🧾','sky'], store:['🛍️','pink'], transfer:['🐷','mint'], activity:['📒','butter'] };
-const TEACHER_LOOK = { students:['🎒','pink'], households:['🏡','mint'], payroll:['💵','butter'], bills:['🧾','lav'], store:['🛍️','sky'], ledger:['📒','pink'], settings:['⚙️','mint'] };
+const TEACHER_LOOK = { students:['🎒','pink'], households:['🏡','mint'], payroll:['💵','butter'], send:['🎁','sky'], bills:['🧾','lav'], store:['🛍️','sky'], ledger:['📒','pink'], settings:['⚙️','mint'] };
 function tabButtonsHtml(tabs, look, activeKey){
   return tabs.map(([k,l])=>{ const [ico,col] = look[k] || ['','pink']; return `<button class="tab c-${col} ${activeKey===k?'active':''}" data-tab="${k}"><span class="tab-ico">${ico}</span>${l}</button>`; }).join('');
 }
@@ -915,7 +917,7 @@ function bindTeacherShell(){
   });
   const content = document.getElementById('teacherContent');
   const renderers = {
-    students: renderTeacherStudents, households: renderTeacherHouseholds, payroll: renderTeacherPayroll,
+    students: renderTeacherStudents, households: renderTeacherHouseholds, payroll: renderTeacherPayroll, send: renderTeacherSend,
     bills: renderTeacherBills, store: renderTeacherStore, ledger: renderTeacherLedger, settings: renderTeacherSettings
   };
   content.innerHTML = renderers[uiState.teacherTab]();
@@ -993,6 +995,7 @@ function bindTeacherTab(tab){
   }
   if (tab==='households') bindHouseholds();
   if (tab==='payroll') bindPayroll();
+  if (tab==='send') bindTeacherSend();
   if (tab==='bills') bindBills();
   if (tab==='store') bindStore();
   if (tab==='ledger') bindLedger();
@@ -1207,6 +1210,174 @@ function bindPayroll(){
 }
 
 /* ---- Bills tab ---- */
+/* ---- Send Money tab: the teacher deposits money into students' accounts ---- */
+function splitEvenly(totalCents, ids){
+  const base = Math.floor(totalCents / ids.length);
+  let rem = totalCents - base * ids.length;
+  return ids.map(id=>{ const amt = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--; return { studentId:id, amount:amt }; });
+}
+function tsRecipients(mode, amount, ids, householdId){
+  if (mode === 'household'){
+    const members = db.students.filter(st=>st.householdId === householdId).map(st=>st.id);
+    return members.length ? splitEvenly(amount, members) : [];
+  }
+  return ids.filter(id=>getStudent(id)).map(id=>({ studentId:id, amount }));
+}
+function depositBatches(){
+  const groups = {};
+  db.transactions.filter(t=>t.type === 'deposit').forEach(t=>{
+    const key = t.batchId || t.id;
+    (groups[key] = groups[key] || { key, txs:[] }).txs.push(t);
+  });
+  return Object.values(groups).map(g=>({ ...g, ts:Math.max(...g.txs.map(t=>t.ts)) })).sort((a,b)=>b.ts-a.ts).slice(0, 15);
+}
+function renderTeacherSend(){
+  const mode = uiState.tsMode || 'student';
+  const sorted = db.students.slice().sort((a,b)=>a.name.localeCompare(b.name));
+  const modeNote = {
+    student: 'Deposits the full amount into one student\'s account.',
+    students: 'Deposits the FULL amount into every student you check — nothing is split.',
+    household: 'Splits the amount evenly across every member of the household (any leftover pennies are handed out one at a time).'
+  }[mode];
+  const batches = depositBatches();
+  const batchRows = batches.map(g=>{
+    const amounts = g.txs.map(t=>t.amount);
+    const lo = Math.min(...amounts), hi = Math.max(...amounts);
+    const amountLabel = g.txs.length === 1 ? money(lo) : (lo === hi ? `${money(lo)} each` : `${money(amounts.reduce((a,b)=>a+b,0))} total (split)`);
+    const names = g.txs.map(t=>getStudent(t.studentId)?.name).filter(Boolean).sort((a,b)=>a.localeCompare(b));
+    const who = names.slice(0,3).join(', ') + (names.length > 3 ? ` +${names.length-3} more` : '');
+    const note = String(g.txs[0].desc || '').replace(/^From teacher\s*—?\s*/, '') || '—';
+    return `<tr>
+      <td class="small-note" style="margin:0;">${fmtDate(g.ts)}</td>
+      <td>${escapeHtml(note)}</td>
+      <td class="mono ledger-amt pos">${amountLabel}</td>
+      <td>${escapeHtml(who || '—')}</td>
+      <td>${(g.txs[0].account||'checking')}</td>
+      <td><button class="btn sm ghost" data-undo-send="${g.key}">Undo</button></td>
+    </tr>`;
+  }).join('');
+  return `
+  <div class="card">
+    <h3>Send money</h3>
+    <div class="small-note">Deposit money into students' accounts — rewards, bonuses, refunds. It shows up in their Activity as "From teacher."</div>
+    <div class="grid3">
+      <div><label>Amount ($)</label><input type="number" step="0.01" min="0" id="tsAmount" placeholder="5.00" value="${escapeHtml(uiState.tsAmount||'')}"></div>
+      <div><label>Deposit into</label>
+        <select id="tsAccount">
+          <option value="checking" ${uiState.tsAccount!=='savings'?'selected':''}>Checking</option>
+          <option value="savings" ${uiState.tsAccount==='savings'?'selected':''}>Savings</option>
+        </select></div>
+      <div><label>Send to</label>
+        <select id="tsMode">
+          <option value="student" ${mode==='student'?'selected':''}>One student</option>
+          <option value="students" ${mode==='students'?'selected':''}>Multiple students (full amount each)</option>
+          <option value="household" ${mode==='household'?'selected':''}>A household (split evenly)</option>
+        </select></div>
+    </div>
+    ${mode==='student' ? `
+      <label>Student</label>
+      <select id="tsStudent">${sorted.map(st=>`<option value="${st.id}">${escapeHtml(st.name)}</option>`).join('')}</select>` : ''}
+    ${mode==='household' ? `
+      <label>Household</label>
+      <select id="tsHousehold">${db.households.map(h=>`<option value="${h.id}">${escapeHtml(h.name)} (${db.students.filter(st=>st.householdId===h.id).length} members)</option>`).join('')}</select>` : ''}
+    ${mode==='students' ? `
+      <label>Select students (each gets the full amount)</label>
+      <div style="margin-bottom:8px;display:flex;gap:8px;">
+        <button type="button" class="btn sm ghost" id="tsSelectAll">Select all</button>
+        <button type="button" class="btn sm ghost" id="tsSelectNone">Clear</button>
+      </div>
+      <div style="max-height:200px;overflow-y:auto;border:1.5px solid #B9B2C4;border-radius:10px;padding:10px 14px;margin-bottom:12px;background:#FFFEFB;">
+        ${sorted.length===0 ? `<div class="small-note" style="margin:0;">No students yet.</div>` : sorted.map(st=>`
+          <label class="checkline" style="padding:4px 0;margin:0;"><input type="checkbox" class="ts-multi" value="${st.id}"> ${escapeHtml(st.name)}</label>`).join('')}
+      </div>` : ''}
+    <label>Note (optional)</label>
+    <input type="text" id="tsNote" placeholder="e.g. Great teamwork this week" value="${escapeHtml(uiState.tsNote||'')}">
+    <div class="small-note">${modeNote} You'll be asked to confirm before anything is sent, and you can undo a send below.</div>
+    <button class="btn gold" id="tsSendBtn">Send money</button>
+  </div>
+  <div class="card">
+    <h3>Recent deposits</h3>
+    ${batches.length===0 ? `<div class="empty">Nothing sent yet.</div>` : `
+    <table><thead><tr><th>Date</th><th>Note</th><th>Amount</th><th>Sent to</th><th>Account</th><th></th></tr></thead><tbody>${batchRows}</tbody></table>`}
+  </div>`;
+}
+function bindTeacherSend(){
+  const amountEl = document.getElementById('tsAmount'), noteEl = document.getElementById('tsNote');
+  const acctEl = document.getElementById('tsAccount'), modeEl = document.getElementById('tsMode');
+  // remember what's typed, so switching "Send to" doesn't wipe it
+  amountEl.oninput = ()=>{ uiState.tsAmount = amountEl.value; };
+  noteEl.oninput = ()=>{ uiState.tsNote = noteEl.value; };
+  acctEl.onchange = ()=>{ uiState.tsAccount = acctEl.value; };
+  modeEl.onchange = ()=>{ uiState.tsMode = modeEl.value; render(); };
+  const all = document.getElementById('tsSelectAll'), none = document.getElementById('tsSelectNone');
+  if (all) all.onclick = ()=>{ document.querySelectorAll('.ts-multi').forEach(c=>{ c.checked = true; }); };
+  if (none) none.onclick = ()=>{ document.querySelectorAll('.ts-multi').forEach(c=>{ c.checked = false; }); };
+
+  document.getElementById('tsSendBtn').onclick = async ()=>{
+    const amount = toCents(amountEl.value || '0');
+    if (amount <= 0){ showToast('Enter an amount greater than $0'); return; }
+    const mode = uiState.tsMode || 'student';
+    const account = acctEl.value === 'savings' ? 'savings' : 'checking';
+    const note = noteEl.value.trim();
+    let ids = [], householdId = null;
+    if (mode === 'student'){
+      const v = document.getElementById('tsStudent')?.value;
+      if (!v){ showToast('Choose a student'); return; }
+      ids = [v];
+    } else if (mode === 'students'){
+      ids = Array.from(document.querySelectorAll('.ts-multi:checked')).map(c=>c.value);
+      if (ids.length === 0){ showToast('Check at least one student'); return; }
+    } else {
+      householdId = document.getElementById('tsHousehold')?.value;
+      if (!householdId){ showToast('Choose a household'); return; }
+    }
+    const preview = tsRecipients(mode, amount, ids, householdId);
+    if (preview.length === 0){ showToast('There are no students to send to'); return; }
+    const total = preview.reduce((a,r)=>a+r.amount, 0);
+    const names = preview.map(r=>getStudent(r.studentId)?.name).filter(Boolean);
+    const msg = preview.length === 1
+      ? `Send ${money(total)} to ${names[0]}'s ${account} account?`
+      : (mode === 'household'
+          ? `Split ${money(total)} across ${preview.length} students (${names.join(', ')}) in ${account}?`
+          : `Send ${money(amount)} to each of ${preview.length} students (${money(total)} total) in ${account}?`);
+    if (!(await showConfirm(msg))) return;
+
+    await refreshDb();
+    const recipients = tsRecipients(mode, amount, ids, householdId);   // recompute from the very latest data
+    if (recipients.length === 0){ showToast('There are no students to send to'); render(); return; }
+    const batchId = uid('dep');
+    const desc = note ? `From teacher — ${note}` : 'From teacher';
+    let sent = 0, count = 0;
+    recipients.forEach(r=>{
+      const st = getStudent(r.studentId);
+      if (!st) return;
+      st[account] += r.amount;
+      addTx(st.id, 'deposit', r.amount, desc, account, batchId);
+      sent += r.amount; count++;
+    });
+    uiState.tsAmount = ''; uiState.tsNote = '';
+    await saveDbWithToast(`Sent ${money(sent)} to ${count} student${count===1?'':'s'}`); render();
+  };
+
+  document.querySelectorAll('[data-undo-send]').forEach(b=>{
+    b.onclick = async ()=>{
+      const key = b.dataset.undoSend;
+      if (!(await showConfirm("Undo this deposit? The money will be taken back out of each student's account."))) return;
+      await refreshDb();
+      const txs = db.transactions.filter(t=>t.type === 'deposit' && (t.batchId === key || t.id === key));
+      if (txs.length === 0){ showToast('This deposit no longer exists'); render(); return; }
+      txs.forEach(t=>{
+        const st = getStudent(t.studentId);
+        if (!st) return;
+        if ((t.account || 'checking') === 'savings') st.savings -= t.amount; else st.checking -= t.amount;
+      });
+      const gone = new Set(txs.map(t=>t.id));
+      db.transactions = db.transactions.filter(t=>!gone.has(t.id));
+      await saveDbWithToast('Deposit undone'); render();
+    };
+  });
+}
+
 function groupCharges(){
   // One group per time a bill was issued. Newer charges carry an issueId; older ones are
   // grouped by bill + issued within a minute of each other.
@@ -1708,6 +1879,7 @@ function bindStore(){
 const TX_TYPE_FILTERS = [
   ['all','All types'],
   ['payday','Paychecks'],
+  ['deposit','Money from teacher'],
   ['bill-payment','Bill payments'],
   ['purchase','Purchases'],
   ['transfer-out','Money sent to classmates'],
@@ -1761,7 +1933,7 @@ function txSummaryHtml(txs){
 }
 function resetTxFilters(){
   Object.assign(uiState, { ledgerFilter:'', ledgerType:'all', ledgerSearch:'', ledgerFrom:'', ledgerTo:'', ledgerGroup:true, expandedTx:{},
-                           actType:'all', actSearch:'', actFrom:'', actTo:'', actGroup:true, expandedStx:{} });
+                           actType:'all', actSearch:'', actFrom:'', actTo:'', actGroup:true, expandedStx:{}, tsMode:'student', tsAmount:'', tsNote:'', tsAccount:'checking' });
 }
 
 function ledgerTxRow(t, sub){
